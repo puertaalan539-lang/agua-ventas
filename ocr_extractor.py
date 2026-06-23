@@ -22,7 +22,10 @@ from dataclasses import dataclass, field
 try:
     import pytesseract
     from PIL import Image
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    import platform
+    if platform.system() == "Windows":
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # En Linux (Streamlit Cloud) tesseract queda en PATH automáticamente
     TESSERACT_OK = True
 except ImportError:
     TESSERACT_OK = False
