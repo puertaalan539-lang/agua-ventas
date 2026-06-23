@@ -1,143 +1,234 @@
 """
 ocr_extractor.py
-Extracción de datos de ventas desde fotos de la pantalla LCD del dispensador.
+Arquitectura de 2 pasos para leer pantallas LCD dot-matrix de dispensadores.
 
-Formato real de la pantalla (uno por producto, 3 fotos por local):
-    PRODUCTO 1      Sig.->
-    NO.venta =52
-    Dinero   =728
-    btn menos = borrar
+PASO A — Volcado OCR: imagen → texto crudo → debug_ocr_crudo.txt
+PASO B — Parser:      txt → regex ultra-tolerantes → datos estructurados
 
-Mapeo fijo (igual en los 7 locales):
-    PRODUCTO 1 -> Garrafón
-    PRODUCTO 2 -> Medio Garrafón
-    PRODUCTO 3 -> Galón
+Requiere: pip install pytesseract pillow opencv-python-headless
+Tesseract instalado en: C:\\Program Files\\Tesseract-OCR\\tesseract.exe
 """
 
 import re
 import io
+import os
+import cv2
+import numpy as np
+from pathlib import Path
+from datetime import datetime
 from dataclasses import dataclass, field
 
-# pip install pytesseract pillow
+# ── Tesseract ──────────────────────────────────────────────────────────────────
 try:
     import pytesseract
-    from PIL import Image, ImageOps, ImageFilter
+    from PIL import Image
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     TESSERACT_OK = True
 except ImportError:
     TESSERACT_OK = False
 
-# pip install google-cloud-vision  (opcional)
+# ── Google Vision (opcional) ───────────────────────────────────────────────────
 try:
-    from google.cloud import vision
+    from google.cloud import vision as gvision
     GOOGLE_VISION_OK = True
 except ImportError:
     GOOGLE_VISION_OK = False
 
-
-# Mapeo fijo PRODUCTO N -> nombre interno
-MAPEO_PRODUCTO = {
-    1: "garrafon",
-    2: "medio_garrafon",
-    3: "galon",
-}
+# ── Configuración ──────────────────────────────────────────────────────────────
+DEBUG_TXT = Path("debug_ocr_crudo.txt")   # archivo de volcado (se sobrescribe)
+MAPEO_PRODUCTO = {1: "garrafon", 2: "medio_garrafon", 3: "galon"}
 
 
-# ──────────────────────────────────────────────
-# DATACLASS DE RESULTADO OCR (una sola pantalla)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DATACLASSES
+# ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class LecturaPantalla:
-    texto_crudo: str = ""
-    producto_num: int | None = None     # 1, 2 o 3
-    producto_nombre: str = ""           # garrafon / medio_garrafon / galon
-    no_venta: int = 0                   # cantidad de unidades vendidas
-    dinero: float = 0.0                 # total en $ de ese producto
-    confianza: str = "baja"             # 'alta' | 'media' | 'baja'
-    errores: list[str] = field(default_factory=list)
+    texto_crudo:     str        = ""
+    producto_num:    int | None = None
+    producto_nombre: str        = ""
+    no_venta:        int        = 0
+    dinero:          float      = 0.0
+    confianza:       str        = "baja"   # 'alta' | 'media' | 'baja'
+    errores:         list[str]  = field(default_factory=list)
 
 
-# ──────────────────────────────────────────────
-# EXTRACCIÓN DE TEXTO
-# ──────────────────────────────────────────────
-def _preprocesar_imagen(img: "Image.Image") -> "Image.Image":
+@dataclass
+class ResultadoLocal:
+    garrafon_no_venta: int   = 0
+    garrafon_dinero:   float = 0.0
+    medio_no_venta:    int   = 0
+    medio_dinero:      float = 0.0
+    galon_no_venta:    int   = 0
+    galon_dinero:      float = 0.0
+    lecturas:          list  = field(default_factory=list)
+    advertencias:      list  = field(default_factory=list)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO A — PREPROCESAMIENTO + EXTRACCIÓN + VOLCADO A TXT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _preprocesar_opencv(imagen_bytes: bytes) -> np.ndarray:
     """
-    Mejora una foto de pantalla LCD para OCR:
-    - Escala de grises
-    - Aumenta tamaño (Tesseract lee mejor texto grande)
-    - Aumenta contraste (sin binarizar a umbral fijo, que destruye texto variable)
+    Preprocesamiento para pantallas LCD dot-matrix sobre fondo azul:
+
+    1. Decodifica bytes → BGR
+    2. Escala de grises
+    3. Morphological Closing (kernel 3×3) → "derrite" los puntos sueltos
+       en trazos sólidos, rellenando huecos entre píxeles de las letras
+    4. Binarización Otsu → blanco/negro puro para Tesseract
+    5. Upscale 3× → Tesseract prefiere texto grande (>30 px de altura)
     """
-    img = img.convert("L")  # escala de grises
+    arr = np.frombuffer(imagen_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    # Escalar 2.5x — Tesseract funciona mucho mejor con texto grande
-    w, h = img.size
-    img = img.resize((int(w * 2.5), int(h * 2.5)), Image.LANCZOS)
+    # 1. Escala de grises
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-    # Aumentar contraste de forma adaptativa (no destructiva)
-    img = ImageOps.autocontrast(img, cutoff=1)
+    # 2. Morphological Closing — conecta los puntos de las letras dot-matrix
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    return img
+    # 3. Binarización Otsu (umbral automático, robusto con fondos de color)
+    _, binary = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 4. Upscale 3× (interpolación cúbica para suavizar bordes)
+    h, w = binary.shape
+    upscaled = cv2.resize(binary, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+
+    return upscaled
+
+
+def _volcar_txt(texto: str, filepath: Path = DEBUG_TXT) -> None:
+    """Guarda el texto crudo OCR en un archivo TXT con timestamp."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    contenido = f"=== OCR Dump [{ts}] ===\n{texto}\n"
+    filepath.write_text(contenido, encoding="utf-8")
 
 
 def extraer_texto_tesseract(imagen_bytes: bytes) -> str:
+    """PASO A con Tesseract: preprocesa → OCR → vuelca a TXT → retorna string."""
     if not TESSERACT_OK:
-        raise RuntimeError("pytesseract no instalado. Ejecuta: pip install pytesseract pillow")
-    img = Image.open(io.BytesIO(imagen_bytes))
-    img = _preprocesar_imagen(img)
-    # psm 6 = bloque uniforme de texto, ideal para pantallas LCD
+        raise RuntimeError("pytesseract no instalado.")
+
+    img_cv  = _preprocesar_opencv(imagen_bytes)
+    img_pil = Image.fromarray(img_cv)
+
+    # psm 6 = bloque de texto uniforme | oem 3 = LSTM (mejor para ruido)
     config = "--oem 3 --psm 6"
-    return pytesseract.image_to_string(img, config=config)
+    texto  = pytesseract.image_to_string(img_pil, config=config)
 
-
-def extraer_texto_google_vision(imagen_bytes: bytes) -> str:
-    if not GOOGLE_VISION_OK:
-        raise RuntimeError("google-cloud-vision no instalado.")
-    client = vision.ImageAnnotatorClient()
-    image  = vision.Image(content=imagen_bytes)
-    resp   = client.text_detection(image=image)
-    if resp.error.message:
-        raise RuntimeError(f"Google Vision error: {resp.error.message}")
-    return resp.text_annotations[0].description if resp.text_annotations else ""
-
-
-# ──────────────────────────────────────────────
-# PARSEO DEL TEXTO DE LA PANTALLA LCD
-# ──────────────────────────────────────────────
-# OCR de pantallas LCD suele confundir: O<->0, l<->1, S<->5, B<->8
-# Por eso los patrones son flexibles con esos caracteres.
-
-# OCR de pantallas LCD suele confundir: O<->0, l<->1, S<->5, B<->8, N<->H
-# Por eso los patrones son MUY flexibles, casi solo anclados en los números.
-
-PATRON_PRODUCTO = r"[PF][R8][O0][D0][U0][C0][T7][O0]\D{0,6}(\d)"
-PATRON_VENTA    = r"[NH][O0]\W{0,4}venta\W{0,3}[=:-]?\W{0,2}(\d+)"
-PATRON_DINERO   = r"[D0]iner[o0]\W{0,3}[=:-]?\W{0,2}(\d+(?:[.,]\d+)?)"
-
-# Patrón de respaldo: si lo anterior falla, busca "=NUM" en cualquier línea
-PATRON_NUM_GENERICO = r"=\W{0,2}(\d+)"
-
-
-def _corregir_ocr_basico(texto: str) -> str:
-    """Normaliza espacios y caracteres comunes mal leídos en contexto numérico."""
-    # No reemplazamos globalmente O/0 porque rompería palabras; los patrones
-    # de arriba ya contemplan ambas variantes donde importa.
+    _volcar_txt(texto)
     return texto
 
 
-def parsear_lectura(texto: str) -> LecturaPantalla:
-    """Convierte el texto crudo de una foto de pantalla en datos estructurados."""
+def extraer_texto_google_vision(imagen_bytes: bytes) -> str:
+    """PASO A con Google Vision: llama API → vuelca a TXT → retorna string."""
+    if not GOOGLE_VISION_OK:
+        raise RuntimeError("google-cloud-vision no instalado.")
+
+    # Google Vision es robusto, no necesita preprocesamiento agresivo
+    client = gvision.ImageAnnotatorClient()
+    image  = gvision.Image(content=imagen_bytes)
+    resp   = client.text_detection(image=image)
+
+    if resp.error.message:
+        raise RuntimeError(f"Google Vision error: {resp.error.message}")
+
+    texto = resp.text_annotations[0].description if resp.text_annotations else ""
+    _volcar_txt(texto)
+    return texto
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO B — PARSER INDEPENDIENTE (regex ultra-tolerantes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Regex para "PRODUCTO N" ────────────────────────────────────────────────────
+# Soporta: PRODUCTO, PR0DUCT0, P R O D U C T O, PRQDUCTO, PROD., PRODU, etc.
+# Seguido opcionalmente de espacios/puntos y luego el dígito del producto.
+RE_PRODUCTO = re.compile(
+    r"P\s*[R8]\s*[O0Q]\s*[D0]\s*[U\|]\s*[C6]\s*[T7]\s*[O0Q]"  # PRODUCTO completo (tolerante)
+    r"[\s\.\-:]*"                                                  # separador opcional
+    r"(\d)",                                                       # número de producto
+    re.IGNORECASE
+)
+# Respaldo si la palabra queda truncada: "PROD" seguido de dígito cercano
+RE_PRODUCTO_FALLBACK = re.compile(
+    r"PR[O0Q][D0][\w\s\.\-]{0,8}?(\d)\s",
+    re.IGNORECASE
+)
+
+# ── Regex para "NO.venta =N" ──────────────────────────────────────────────────
+# Soporta: NO.venta, H0.venta, ND. venta, N0 . v e n t a, NOventa, etc.
+# El separador (= - :) puede faltar o variar.
+RE_VENTA = re.compile(
+    r"[NH]\s*[O0D]\s*[\.\,]?\s*"          # NO. / H0. / ND.
+    r"v\s*e\s*n\s*t\s*a"                   # v e n t a (con posibles espacios)
+    r"\s*[=\-:\.]*\s*"                     # separador tolerante
+    r"(\d+)",                              # cantidad
+    re.IGNORECASE
+)
+# Respaldo: cualquier línea con "enta" seguido de separador y número
+RE_VENTA_FALLBACK = re.compile(
+    r"enta[\s=\-:\.]*(\d+)",
+    re.IGNORECASE
+)
+
+# ── Regex para "Dinero =N" ────────────────────────────────────────────────────
+# Soporta: Dinero, D1nero, Dlnero, Dinero, dinero
+RE_DINERO = re.compile(
+    r"[D0]\s*[I1L|]\s*[N]\s*[E3]\s*[R]\s*[O0]"   # D i n e r o tolerante
+    r"\s*[=\-:\.]*\s*"                              # separador
+    r"(\d+(?:[.,]\d+)?)",                           # monto (entero o decimal)
+    re.IGNORECASE
+)
+# Respaldo: línea con "nero" o "iner" + separador + número
+RE_DINERO_FALLBACK = re.compile(
+    r"[ni]ner[o0]?\s*[=\-:\.]*\s*(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE
+)
+
+# ── Respaldo nuclear: extrae pares "=NUM" por orden de aparición ──────────────
+RE_IGUAL_NUM = re.compile(r"[=\-:]\s*(\d+(?:[.,]\d+)?)")
+
+
+def parsear_archivo_txt(filepath: Path = DEBUG_TXT) -> LecturaPantalla:
+    """
+    PASO B — Lee el archivo TXT volcado y extrae datos con regex ultra-tolerantes.
+
+    Args:
+        filepath: Ruta al TXT generado por el Paso A (por defecto debug_ocr_crudo.txt)
+
+    Returns:
+        LecturaPantalla con los datos extraídos.
+    """
+    if not filepath.exists():
+        res = LecturaPantalla()
+        res.errores.append(f"Archivo {filepath} no encontrado.")
+        return res
+
+    texto = filepath.read_text(encoding="utf-8")
+    return parsear_texto(texto)
+
+
+def parsear_texto(texto: str) -> LecturaPantalla:
+    """
+    Aplica las regex al texto crudo y retorna LecturaPantalla.
+    Se puede llamar directamente con un string (útil para tests).
+    """
     res = LecturaPantalla(texto_crudo=texto)
-    texto_norm = _corregir_ocr_basico(texto)
-    lineas = [l for l in texto_norm.split("\n") if l.strip()]
-
-    m_prod = re.search(PATRON_PRODUCTO, texto_norm, re.IGNORECASE)
-    m_vta  = re.search(PATRON_VENTA,    texto_norm, re.IGNORECASE)
-    m_din  = re.search(PATRON_DINERO,   texto_norm, re.IGNORECASE)
-
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
     campos_ok = 0
 
-    if m_prod:
-        num = int(m_prod.group(1))
+    # ── 1. PRODUCTO ────────────────────────────────────────────────────────────
+    m = RE_PRODUCTO.search(texto)
+    if not m:
+        m = RE_PRODUCTO_FALLBACK.search(texto)
+
+    if m:
+        num = int(m.group(1))
         if num in MAPEO_PRODUCTO:
             res.producto_num    = num
             res.producto_nombre = MAPEO_PRODUCTO[num]
@@ -145,41 +236,52 @@ def parsear_lectura(texto: str) -> LecturaPantalla:
         else:
             res.errores.append(f"Número de producto '{num}' fuera de rango (1-3).")
     else:
-        res.errores.append("No se detectó la línea 'PRODUCTO N'.")
+        res.errores.append("No se detectó PRODUCTO N.")
 
-    # Si falla el patrón estricto de venta, intenta línea por línea con "=NUM"
-    if m_vta:
-        res.no_venta = int(m_vta.group(1))
+    # ── 2. NO.venta ────────────────────────────────────────────────────────────
+    m = RE_VENTA.search(texto)
+    if not m:
+        m = RE_VENTA_FALLBACK.search(texto)
+
+    if m:
+        res.no_venta = int(m.group(1))
         campos_ok += 1
     else:
-        for linea in lineas:
-            if "venta" in linea.lower() or re.search(r"[NH][O0]\W", linea, re.IGNORECASE):
-                m_fallback = re.search(PATRON_NUM_GENERICO, linea)
-                if m_fallback:
-                    res.no_venta = int(m_fallback.group(1))
-                    campos_ok += 1
-                    break
-        else:
-            res.errores.append("No se detectó 'NO.venta ='.")
+        # Respaldo nuclear: segundo número después de "=" en el texto
+        nums = RE_IGUAL_NUM.findall(texto)
+        if len(nums) >= 2:
+            try:
+                res.no_venta = int(nums[1].replace(",", ""))
+                campos_ok += 1
+            except ValueError:
+                pass
+        if campos_ok < 2:
+            res.errores.append("No se detectó NO.venta.")
 
-    # Igual respaldo para Dinero
-    if m_din:
-        res.dinero = float(m_din.group(1).replace(",", "."))
+    # ── 3. Dinero ──────────────────────────────────────────────────────────────
+    m = RE_DINERO.search(texto)
+    if not m:
+        m = RE_DINERO_FALLBACK.search(texto)
+
+    if m:
+        res.dinero = float(m.group(1).replace(",", "."))
         campos_ok += 1
     else:
-        for linea in lineas:
-            if "iner" in linea.lower():
-                m_fallback = re.search(PATRON_NUM_GENERICO, linea)
-                if m_fallback:
-                    res.dinero = float(m_fallback.group(1).replace(",", "."))
-                    campos_ok += 1
-                    break
-        else:
-            res.errores.append("No se detectó 'Dinero ='.")
+        # Respaldo nuclear: tercer número después de "=" en el texto
+        nums = RE_IGUAL_NUM.findall(texto)
+        if len(nums) >= 3:
+            try:
+                res.dinero = float(nums[2].replace(",", "."))
+                campos_ok += 1
+            except ValueError:
+                pass
+        if res.dinero == 0.0:
+            res.errores.append("No se detectó Dinero.")
 
+    # ── Evaluación de confianza ────────────────────────────────────────────────
     if campos_ok == 3:
         res.confianza = "alta"
-        res.errores = []
+        res.errores   = []
     elif campos_ok == 2:
         res.confianza = "media"
     else:
@@ -188,26 +290,27 @@ def parsear_lectura(texto: str) -> LecturaPantalla:
     return res
 
 
-# ──────────────────────────────────────────────
-# FUNCIÓN PRINCIPAL — una sola foto/pantalla
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCIÓN PRINCIPAL — orquesta Paso A + Paso B
+# ══════════════════════════════════════════════════════════════════════════════
+
 def procesar_imagen(imagen_bytes: bytes, motor: str = "tesseract") -> LecturaPantalla:
     """
-    Extrae y parsea los datos de UNA pantalla (un producto).
+    Paso A + Paso B en una sola llamada.
 
     Args:
-        imagen_bytes: Contenido binario de la imagen.
+        imagen_bytes: Bytes de la imagen (jpg/png/webp).
         motor: "tesseract" | "google"
 
     Returns:
-        LecturaPantalla con producto, no_venta y dinero detectados.
+        LecturaPantalla con los datos finales.
     """
     try:
         if motor == "google":
-            texto = extraer_texto_google_vision(imagen_bytes)
+            extraer_texto_google_vision(imagen_bytes)
         else:
-            texto = extraer_texto_tesseract(imagen_bytes)
-        return parsear_lectura(texto)
+            extraer_texto_tesseract(imagen_bytes)
+        return parsear_archivo_txt(DEBUG_TXT)
     except Exception as e:
         res = LecturaPantalla()
         res.errores.append(str(e))
@@ -215,34 +318,16 @@ def procesar_imagen(imagen_bytes: bytes, motor: str = "tesseract") -> LecturaPan
         return res
 
 
-# ──────────────────────────────────────────────
-# FUNCIÓN COMBINADA — las 3 fotos de un local
-# ──────────────────────────────────────────────
-@dataclass
-class ResultadoLocal:
-    garrafon_no_venta: int = 0
-    garrafon_dinero: float = 0.0
-    medio_no_venta: int = 0
-    medio_dinero: float = 0.0
-    galon_no_venta: int = 0
-    galon_dinero: float = 0.0
-    lecturas: list[LecturaPantalla] = field(default_factory=list)
-    advertencias: list[str] = field(default_factory=list)
-
-
 def procesar_local_completo(
-    imagenes: dict[int, bytes],   # {1: bytes_producto1, 2: bytes_producto2, 3: bytes_producto3}
+    imagenes: dict[int, bytes],
     motor: str = "tesseract"
 ) -> ResultadoLocal:
     """
-    Procesa las 3 fotos de un local (una por PRODUCTO) y combina resultados.
+    Procesa las 3 fotos de un local y combina los resultados.
 
     Args:
-        imagenes: dict con las claves 1, 2, 3 -> bytes de cada foto.
-        motor: motor OCR a usar.
-
-    Returns:
-        ResultadoLocal con los 3 productos ya combinados.
+        imagenes: {1: bytes_prod1, 2: bytes_prod2, 3: bytes_prod3}
+        motor: "tesseract" | "google"
     """
     out = ResultadoLocal()
 
@@ -250,19 +335,18 @@ def procesar_local_completo(
         lectura = procesar_imagen(img_bytes, motor=motor)
         out.lecturas.append(lectura)
 
+        producto_usar = lectura.producto_num or num_esperado
+
         if lectura.producto_num is None:
             out.advertencias.append(
-                f"Foto subida como Producto {num_esperado}: no se pudo leer el número de producto."
+                f"Foto {num_esperado}: no se detectó número de producto — "
+                f"se asume PRODUCTO {num_esperado}."
             )
-            # Usamos el número esperado como respaldo si el OCR falló en detectarlo
-            producto_usar = num_esperado
-        else:
-            producto_usar = lectura.producto_num
-            if lectura.producto_num != num_esperado:
-                out.advertencias.append(
-                    f"⚠️ Subiste la foto en la casilla 'Producto {num_esperado}' "
-                    f"pero la pantalla dice 'Producto {lectura.producto_num}'. Verifica el orden."
-                )
+        elif lectura.producto_num != num_esperado:
+            out.advertencias.append(
+                f"⚠️ Foto subida como Producto {num_esperado} "
+                f"pero la pantalla dice Producto {lectura.producto_num}. Verifica el orden."
+            )
 
         if producto_usar == 1:
             out.garrafon_no_venta = lectura.no_venta
@@ -275,8 +359,6 @@ def procesar_local_completo(
             out.galon_dinero   = lectura.dinero
 
         if lectura.confianza != "alta":
-            out.advertencias.extend(
-                [f"Producto {num_esperado}: {e}" for e in lectura.errores]
-            )
+            out.advertencias += [f"Producto {num_esperado}: {e}" for e in lectura.errores]
 
     return out
