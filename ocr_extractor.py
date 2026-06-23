@@ -89,14 +89,11 @@ class ResultadoLocal:
 
 def _preprocesar_opencv(imagen_bytes: bytes) -> np.ndarray:
     """
-    Preprocesamiento para pantallas LCD dot-matrix sobre fondo azul:
-
+    Preprocesamiento minimalista y estable en Windows y Linux:
     1. Decodifica bytes → BGR
     2. Escala de grises
-    3. Morphological Closing (kernel 3×3) → "derrite" los puntos sueltos
-       en trazos sólidos, rellenando huecos entre píxeles de las letras
-    4. Binarización Otsu → blanco/negro puro para Tesseract
-    5. Upscale 3× → Tesseract prefiere texto grande (>30 px de altura)
+    3. Upscale 3× con interpolación cúbica
+    4. Aumento de contraste adaptativo (CLAHE) — robusto con fondos de color
     """
     arr = np.frombuffer(imagen_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -104,18 +101,15 @@ def _preprocesar_opencv(imagen_bytes: bytes) -> np.ndarray:
     # 1. Escala de grises
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-    # 2. Morphological Closing — conecta los puntos de las letras dot-matrix
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # 2. Upscale 3×
+    h, w = gray.shape
+    upscaled = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
 
-    # 3. Binarización Otsu (umbral automático, robusto con fondos de color)
-    _, binary = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3. CLAHE — aumenta contraste localmente sin destruir el texto
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    resultado = clahe.apply(upscaled)
 
-    # 4. Upscale 3× (interpolación cúbica para suavizar bordes)
-    h, w = binary.shape
-    upscaled = cv2.resize(binary, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
-
-    return upscaled
+    return resultado
 
 
 def _volcar_txt(texto: str, filepath: Path = DEBUG_TXT) -> None:
